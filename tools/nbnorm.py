@@ -6,6 +6,9 @@ import sys
 import os
 import tempfile
 import shutil
+import re
+from pathlib import Path
+from enum import Enum
 
 from util import replace_file_with_string, xpath, truncate
 
@@ -23,7 +26,6 @@ assert IPython.version_info[0] >= 4
 
 import nbformat
 from nbformat.notebooknode import NotebookNode
-from nbformat.sign import NotebookNotary as Notary
 
 # not customizable yet
 # at the notebook level
@@ -102,7 +104,7 @@ def clear_metadata(metadata, padding):
         if not isinstance(v, dict):
             del metadata[k]
 
-                
+
 ####################
 class Notebook:
 
@@ -127,10 +129,7 @@ class Notebook:
         return xpath(self.notebook, path)
 
     def cells(self):
-        try:
-            return self.xpath(['worksheets', 0, 'cells'])
-        except:
-            return self.xpath(['cells'])
+        return self.xpath(['cells'])
 
     def cell_contents(self, cell):
         return cell['source']
@@ -165,9 +164,9 @@ class Notebook:
         if self.verbose:
             print("{} -> {}".format(self.filename, metadata[notebookname]))
 
-    def set_version(self, version=default_version, force=False):
+    def set_version(self, version=default_version, force_version=False):
         metadata = self.xpath(['metadata'])
-        if 'version' not in metadata or force:
+        if 'version' not in metadata or force_version:
             metadata['version'] = version
 
     # the kernel parameter here is the one that comes
@@ -252,7 +251,7 @@ div.title-slide {
 <span>{html_image}</span>
 </div>'''
 
-        
+
         title_image_format = '<img src="{logo_path}" style="display:inline" />'
         html_image = "" if not logo_path else \
                       title_image_format.format(logo_path=logo_path)
@@ -278,7 +277,7 @@ div.title-slide {
         title_lines = [ line + "\n" for line in title_line.split("\n") ]
         # remove last \n
         title_lines[-1] = title_lines[-1][:-1]
-        
+
         first_cell = self.cells()[0]
         # cell.source is a list of strings
         if is_title_cell(first_cell):
@@ -330,42 +329,61 @@ div.title-slide {
         if nb_empty:
             print("found and removed {} empty cells".format(nb_empty))
 
-    # likewise, this was a one-shot thing, we don't create rawnbconvert any
-    # longer
-    def translate_rawnbconvert(self):
-        """
-        all cells of type rawnbconvert are translated into a markdown cell
-        with 4 spaces indentation
-        """
-        nb_raw_cells = 0
-        for cell in self.cells():
-            if cell['cell_type'] == 'raw':
-                source = cell['source']
-                if self.verbose:
-                    print("Got a raw cell with source of type {}".format(
-                        type(source)))
-                    print(">>>{}<<<".format(source))
-                    print("split:XXX{}XXX".format(source.split("\n")))
-                if isinstance(cell['source'], str):
-                    cell['cell_type'] = 'markdown'
-                    cell['source'] = "    " + "\n    ".join(source.split("\n"))
-                    nb_raw_cells += 1
-                elif isinstance(cell['source'], list):
-                    cell['cell_type'] = 'markdown'
-                    cell['source'] = ['    ' + line for line in cell['source']]
-                    nb_raw_cells += 1
-                else:
-                    print("WARNING: dont know how to deal with a raw cell (type {})".format(
-                        type(cell['source'])))
-        if nb_raw_cells:
-            print("found and rewrote {} raw cells".format(nb_raw_cells))
+    re_blank = re.compile(r"\A\s*\Z")
+    re_bullet = re.compile(r"\A\s*\*\s")
+    class Line(Enum):
+        BLANK = 0
+        BULLET = 1
+        REGULAR = 2
 
-    def sign(self):
-        notary = Notary()
-        signature = notary.compute_signature(self.notebook)
-        if not signature.startswith("sha256:"):
-            signature = "sha256:" + signature
-        self.notebook['metadata']['signature'] = signature
+    def line_class(self, line):
+        if not line or self.re_blank.match(line):
+            return self.Line.BLANK
+        if self.re_bullet.match(line):
+            return self.Line.BULLET
+        return self.Line.REGULAR
+
+    # this is an attempt at spotting a bad practice
+    def spot_ill_formed_markdown_bullets(self):
+        """
+        Regular markdown has it that if a bullet list is inserted right after
+        a paragraph, there must be a blank line before the bullets.
+        However this somehow is not enforced by jupyter,  and being lazy
+        I have ended up used this **a lot**; but that does not play well with
+        pdf generation.
+        """
+        nb_patches = 0
+        for cell in self.cells():
+            if cell['cell_type'] != 'markdown':
+                continue
+            source = cell['source']
+            # oddly enough, we observe that the logo cells
+            # come up with source being a list, while all others
+            # show up as str
+            if type(source) is list:
+                continue
+            new_lines = []
+            lines = source.split("\n")
+            # it's convenient to take line #0 as a blank line
+            curr_type = self.Line.BLANK
+            for line in lines:
+                next_type = self.line_class(line)
+                # this seems to be the only case that matters
+                if (curr_type == self.Line.REGULAR
+                    and next_type == self.Line.BULLET):
+                        # insert artificial newline
+                        new_lines.append("")
+                        nb_patches += 1
+                # always preserve initial input
+                new_lines.append(line)
+                # remember for next line
+                curr_type = next_type
+            new_source = "\n".join(new_lines)
+            if  new_source != source:
+                cell['source'] = new_source
+        if nb_patches != 0:
+            print(f"In {self.name}:"
+                  f"fixed {nb_patches} occurrences of ill-formed bullet")
 
     def save(self, keep_alt=False):
         if keep_alt:
@@ -378,23 +396,21 @@ div.title-slide {
         if replace_file_with_string(outfilename, new_contents):
             print("{} saved into {}".format(self.name, outfilename))
 
-    def full_monty(self, force_name, version, licence, authors, logo_path,
-                   kernel, rise, exts, sign):
+    def full_monty(self, force_name_version, version, licence, authors, logo_path,
+                   kernel, rise, exts):
         self.parse()
-        self.set_name_from_heading1(force_name=force_name)
+        self.clear_all_outputs()
+        self.remove_empty_cells()
+        self.set_name_from_heading1(force_name=force_name_version)
         if version is None:
             self.set_version()
         else:
-            self.set_version(version, force=True)
+            self.set_version(version, force_version=force_name_version)
         self.handle_kernelspec(kernel)
         self.fill_rise_metadata(rise)
         self.fill_extensions_metadata(exts)
         self.ensure_title(licence, authors, logo_path)
-        self.clear_all_outputs()
-        self.remove_empty_cells()
-        self.translate_rawnbconvert()
-        if sign:
-            self.sign()
+        self.spot_ill_formed_markdown_bullets()
         self.save()
 
 
@@ -420,10 +436,8 @@ usage = """normalize notebooks
 
 def main():
     parser = ArgumentParser(usage=usage)
-    parser.add_argument("-f", "--force", action="store", dest="force_name", default=None,
-                        help="force writing notebookname even if already present")
-    parser.add_argument("-s", "--sign", action="store_true", dest="sign", default=False,
-                        help="sign the notebooks")
+    parser.add_argument("-f", "--force", action="store", dest="force_name_version", default=None,
+                        help="force writing notebookname, or version, when provided, even if already present")
     parser.add_argument("-t", "--licence-text", dest='licence', default=default_licence,
                         help="the text for the licence string in titles")
     parser.add_argument("-a", "--author", dest='authors', action="append", default=[], type=str,
@@ -446,8 +460,8 @@ def main():
     args = parser.parse_args()
 
     if not args.notebooks:
-        import glob
-        notebooks = glob.glob("*.ipynb")
+        notebooks = Path().glob("*.ipynb")
+        notebooks = str(notebook for notebook in notebooks)
 
     for notebook in args.notebooks:
         if notebook.find('.alt') >= 0:
@@ -455,10 +469,10 @@ def main():
             continue
         if args.verbose:
             print("{} is opening notebook".format(sys.argv[0]), notebook)
-        full_monty(notebook, force_name=args.force_name, version=args.version,
+        full_monty(notebook, force_name_version=args.force_name_version, version=args.version,
                    licence=args.licence, authors=args.authors, logo_path=args.logo_path,
                    kernel=args.kernel, rise=args.rise, exts=args.exts,
-                   sign=args.sign, verbose=args.verbose)
+                   verbose=args.verbose)
 
 if __name__ == '__main__':
     main()
