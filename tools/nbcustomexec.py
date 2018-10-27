@@ -50,8 +50,24 @@ CODE_TO_EXEC_INSTEAD = "latex:hidden-code-instead"
 CODE_TO_EXEC_BEFORE = "latex:hidden-code-before"
 CODE_TO_EXEC_AFTER = "latex:hidden-code-after"
 
+# replace on the fly
+CODE_REPLACEMENT = "latex:replace"
+REPLACE_ALL = '*all*'
+
+# attach to this key either
+#  * one list with 2 strings
+# [ "ab", "cd"]
+#  * or a list of 2-string lists of that kind
+# [ ["ab", "cd"], ["ef", "gh"]]
+# this will replace all occurrences of "ab" into "cd"
+# and same with the second couple
+#
+#  note that '*ALL*' as the left-hand-side
+# in a replacement means the whole cell gets rewritten
+
+
 # all annotations will mention this string
-MARKER = "automatic execution"
+MARKER = "auto-exec-for-latex"
 
 ##########
 
@@ -68,15 +84,48 @@ def save_notebook(notebook, path: Path):
 
 class CustomExecPreprocessor(ExecutePreprocessor):
 
+    def do_replacement(self, incoming, replacements):
+        """
+        performs replacements as specified in replacements
+
+        Parameters:
+          incoming: the string where replacements are to be done
+          replacements: typically metadata['latex:replace']
+            should be either a 2-string list
+            or a list of 2-string lists
+
+        Returns:
+          a new string
+        """
+        def is_replacement(x):
+            return isinstance(x, list) and len(x) == 2 \
+                and isinstance(x[0], str)
+
+        result = incoming
+        if is_replacement(replacements):
+            replacements = [replacements]
+        for replacement in replacements:
+            if not is_replacement(replacement):
+                print(f"Could not use replacement {replacement}")
+                continue
+            before, after = replacement
+            if before == REPLACE_ALL:
+                result = after
+            else:
+                print(f"replacing {before} with {after}")
+                result = result.replace(before, after)
+        return result
+
     def preprocess_cell(self, cell, resources, cell_index):
 
         # even if we skip a cell, we need to comply with the protocol
         # implemented in the superclass, which expects
         ignored_result = cell, resources
         def mark_ignored(cell):
-            cell.source = (f"# NOTE\n"
-                           f"# {MARKER} has skipped execution of this cell\n\n"
-                           + cell.source)
+            if cell.cell_type == 'code':
+                cell.source = (f"# NOTE\n"
+                               f"# {MARKER} has skipped execution of this cell\n\n"
+                               + cell.source)
 
         substituted_code = None
 
@@ -106,17 +155,26 @@ class CustomExecPreprocessor(ExecutePreprocessor):
                 substituted_code = cell.source
                 cell.source = cell.source + "\n" + metadata[key]
 
+            if key == CODE_REPLACEMENT:
+                replacements = metadata[key]
+                cell.source = self.do_replacement(cell.source, replacements)
 
         execution_result = ExecutePreprocessor.preprocess_cell(
             self, cell, resources, cell_index)
 
-        if substituted_code is not None:
+        if substituted_code is not None and cell.cell_type == 'code':
             cell.source = (substituted_code
                            + f"\n\n# NOTE:\n# {MARKER} has used instead:"
                            + f"\n##########"
                            + f"\n{cell.source}"
                            + f"\n##########"
                            )
+
+        # perform replacements in output as well
+        # nope, that's more complicated than that
+        # if CODE_REPLACEMENT in metadata and cell.cell_type == 'code':
+        #     cell.output = self.do_replacement(
+        #        cell.output, metadata[CODE_REPLACEMENT])
 
         return execution_result
 
